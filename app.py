@@ -1,109 +1,186 @@
+import base64
+import html
 import json
 import os
 import re
+import threading
+import time
+from urllib.parse import urljoin, quote
+
 import requests
-from urllib.parse import urljoin, urlencode, quote
-from flask import Flask, request, Response
+from flask import Flask, Response, request
 
 app = Flask(__name__)
 
-DATA = json.load(open(os.path.join(os.path.dirname(__file__), "channels.json"), encoding="utf-8"))
-CHANNELS = DATA["channels"]
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/122.0.0.0 Safari/537.36")
 
-DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+STREAM_HEADERS = {
+    "User-Agent": UA,
+    "Referer": "https://hamis.romponalis.st/",
+    "Origin": "https://hamis.romponalis.st",
+}
 
+M3U8_TTL = 480        # upstream URL'deki token zaman asimli -> kisa cache
+CHANLIST_TTL = 6 * 3600
 
-# Distinct header sets the playlist needs -> each proxied channel gets an index.
-HEADERS = []
-HINDEX = {}
-
-
-def header_index(h):
-    key = json.dumps(h or {}, sort_keys=True)
-    if key not in HINDEX:
-        HINDEX[key] = len(HEADERS)
-        HEADERS.append(h or {})
-    return HINDEX[key]
+CACHE = {}
+CACHE_LOCK = threading.Lock()
 
 
-for c in CHANNELS:
-    c["hindex"] = header_index(c.get("headers") or {}) if c.get("headers") else None
-    c["needs_proxy"] = bool(c.get("headers"))
+def _get(url, referer):
+    h = {"User-Agent": UA, "Referer": referer}
+    return requests.get(url, headers=h, timeout=15)
 
 
-def base():
-    return request.url_root.rstrip("/")
+def extract_m3u8(cid):
+    """dlive.sx -> stream sayfasi -> daddy iframe -> base64 m3u8. requests only."""
+    s = _get(f"https://dlive.sx/stream/stream-{cid}.php",
+             f"https://dlive.sx/watch.php?id={cid}").text
+    m = re.search(r'src="(https://hamis\.romponalis\.st[^"]+)"', s)
+    if not m:
+        raise ValueError("daddy iframe bulunamadi")
+    d = _get(m.group(1), f"https://dlive.sx/stream/stream-{cid}.php").text
+    b = re.search(r"atob\('([A-Za-z0-9+/=]+)'\)", d)
+    if not b:
+        raise ValueError("m3u8 base64 bulunamadi")
+    return base64.b64decode(b.group(1)).decode()
 
 
-def proxy_url(target, hindex):
-    return base() + "/p?" + urlencode({"u": target, "h": hindex})
+def get_m3u8(cid):
+    now = time.time()
+    with CACHE_LOCK:
+        c = CACHE.get(cid)
+        if c and now - c["time"] < M3U8_TTL:
+            return c["url"]
+    url = extract_m3u8(cid)
+    with CACHE_LOCK:
+        CACHE[cid] = {"url": url, "time": now}
+    return url
 
 
-def rewrite_manifest(text, source_url, hindex):
+def drop_cache(cid):
+    with CACHE_LOCK:
+        CACHE.pop(cid, None)
+
+
+def rewrite(content, source_url, cid):
     out = []
-    for line in text.splitlines():
+    for line in content.splitlines():
         s = line.strip()
         if not s:
             continue
         if s.startswith("#"):
             if "URI=" in s:
-                s = re.sub(
-                    r'URI=["\']([^"\']+)["\']',
-                    lambda m: f'URI="{proxy_url(urljoin(source_url, m.group(1)), hindex)}"',
-                    s,
-                )
+                s = re.sub(r'URI=["\']([^"\']+)["\']',
+                           lambda m: 'URI="/segment?channel=%d&url=%s"'
+                           % (cid, quote(urljoin(source_url, m.group(1)), safe="")),
+                           s)
             out.append(s)
         else:
-            out.append(proxy_url(urljoin(source_url, s), hindex))
+            out.append("/segment?channel=%d&url=%s"
+                       % (cid, quote(urljoin(source_url, s), safe="")))
     return "\n".join(out)
 
 
-def fetch(target_url, hindex, stream=False):
-    headers = {"User-Agent": DEFAULT_UA}
-    headers.update(HEADERS[hindex] or {})
-    return requests.get(target_url, headers=headers, stream=stream, timeout=15)
+def upstream_get(url):
+    s = requests.Session()
+    s.headers.update(STREAM_HEADERS)
+    return s.get(url, timeout=15)
 
 
-@app.route("/playlist.m3u8")
+def channel_list():
+    """Ana sayfadaki programdan id->isim. Basarisizsa gomulu snapshot."""
+    now = time.time()
+    with CACHE_LOCK:
+        c = CACHE.get("chanlist")
+        if c and now - c["time"] < CHANLIST_TTL:
+            return c["url"]
+    try:
+        d = _get("https://dlive.sx/", "https://dlive.sx/").text
+        seen = {}
+        for cid, name in re.findall(r'href="/(?:watch\.php\?id=([0-9]+))"[^>]*title="([^"]+)"', d):
+            cid = int(cid)
+            if cid:
+                seen[cid] = html.unescape(html.unescape(name)).strip()
+        chs = [{"id": i, "name": seen[i]} for i in sorted(seen)]
+        if len(chs) > 50:
+            with CACHE_LOCK:
+                CACHE["chanlist"] = {"url": chs, "time": now}
+            return chs
+    except Exception:
+        pass
+    snap = os.path.join(os.path.dirname(__file__), "channels.json")
+    return json.load(open(snap, encoding="utf-8"))
+
+
 @app.route("/playlist.m3u")
+@app.route("/playlist.m3u8")
 def playlist():
+    base = request.url_root.rstrip("/")
     lines = ["#EXTM3U"]
-    for c in CHANNELS:
-        lines.append(
-            f'#EXTINF:-1 tvg-id="{c["id"]}" tvg-logo="{c.get("logo") or ""}" '
-            f'group-title="{c.get("group") or ""}",{c["name"]}'
-        )
-        if c["needs_proxy"]:
-            lines.append(proxy_url(c["url"], c["hindex"]))
-        else:
-            lines.append(c["url"])
+    for c in channel_list():
+        lines.append("#EXTINF:-1,%s" % c["name"])
+        lines.append("%s/live/%d.m3u8" % (base, c["id"]))
     return Response("\n".join(lines), content_type="application/vnd.apple.mpegurl")
 
 
-@app.route("/p")
-def proxy():
-    target = request.args.get("u")
-    hindex = int(request.args.get("h", 0))
-    if not target:
-        return "no url", 400
+@app.route("/live/<int:cid>.m3u8")
+def live(cid):
     try:
-        r = fetch(target, hindex, stream=True)
-    except requests.RequestException as e:
-        return f"upstream error: {e}", 502
-    if r.status_code != 200:
-        return f"upstream {r.status_code}", r.status_code
+        url = get_m3u8(cid)
+    except Exception as e:
+        return Response("#EXTM3U\n#EXT-X-ENDLIST", status=404,
+                        content_type="application/vnd.apple.mpegurl")
+    for attempt in range(2):
+        try:
+            r = upstream_get(url)
+        except requests.RequestException:
+            return Response("#EXTM3U\n#EXT-X-ENDLIST", status=502,
+                            content_type="application/vnd.apple.mpegurl")
+        if r.status_code in (401, 403) and attempt == 0:
+            drop_cache(cid)
+            try:
+                url = extract_m3u8(cid)
+                with CACHE_LOCK:
+                    CACHE[cid] = {"url": url, "time": time.time()}
+                continue
+            except Exception:
+                break
+        if r.status_code != 200:
+            drop_cache(cid)
+            return Response("#EXTM3U\n#EXT-X-ENDLIST", status=r.status_code,
+                            content_type="application/vnd.apple.mpegurl")
+        return Response(rewrite(r.text, url, cid), content_type="application/vnd.apple.mpegurl")
+    return Response("#EXTM3U\n#EXT-X-ENDLIST", status=502,
+                    content_type="application/vnd.apple.mpegurl")
 
+
+@app.route("/segment")
+def segment():
+    target = request.args.get("url")
+    cid = int(request.args.get("channel", "0"))
+    if not target:
+        return "URL eksik", 400
+    try:
+        s = requests.Session()
+        s.headers.update(STREAM_HEADERS)
+        r = s.get(target, stream=True, timeout=15)
+    except requests.RequestException as e:
+        return "Segment hatasi: %s" % e, 502
+    if r.status_code != 200:
+        if r.status_code in (401, 403):
+            drop_cache(cid)
+        return "Segment error %d" % r.status_code, r.status_code
     ctype = (r.headers.get("Content-Type") or "").lower()
-    if "mpegurl" in ctype or ".m3u8" in target.lower():
-        return Response(
-            rewrite_manifest(r.text, target, hindex),
-            content_type="application/vnd.apple.mpegurl",
-        )
+    if ".m3u8" in target.lower() or "mpegurl" in ctype:
+        return Response(rewrite(r.text, target, cid),
+                        content_type="application/vnd.apple.mpegurl")
 
     def gen():
         for chunk in r.iter_content(chunk_size=64 * 1024):
             yield chunk
-
     return Response(gen(), content_type=r.headers.get("Content-Type", "video/mp2t"))
 
 
