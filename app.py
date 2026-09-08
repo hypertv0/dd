@@ -91,28 +91,35 @@ def upstream_get(url):
 
 
 def channel_list():
-    """Ana sayfadaki programdan id->isim. Basarisizsa gomulu snapshot."""
+    """Gomulu snapshot + ana sayfa programi (birlesim). Yeni kanallar boyle eklenir."""
+    snap = os.path.join(os.path.dirname(__file__), "channels.json")
+    try:
+        union = {c["id"]: c["name"] for c in json.load(open(snap, encoding="utf-8"))}
+    except Exception:
+        union = {}
     now = time.time()
     with CACHE_LOCK:
         c = CACHE.get("chanlist")
         if c and now - c["time"] < CHANLIST_TTL:
-            return c["url"]
+            for ch in c["url"]:
+                union.setdefault(ch["id"], ch["name"])
+            return [{"id": i, "name": union[i]} for i in sorted(union)]
     try:
         d = _get("https://dlive.sx/", "https://dlive.sx/").text
-        seen = {}
+        fresh = []
         for cid, name in re.findall(r'href="/(?:watch\.php\?id=([0-9]+))"[^>]*title="([^"]+)"', d):
             cid = int(cid)
             if cid:
-                seen[cid] = html.unescape(html.unescape(name)).strip()
-        chs = [{"id": i, "name": seen[i]} for i in sorted(seen)]
-        if len(chs) > 50:
+                fresh.append({"id": cid,
+                              "name": html.unescape(html.unescape(name)).strip()})
+        if len(fresh) > 50:
             with CACHE_LOCK:
-                CACHE["chanlist"] = {"url": chs, "time": now}
-            return chs
+                CACHE["chanlist"] = {"url": fresh, "time": now}
+            for ch in fresh:
+                union.setdefault(ch["id"], ch["name"])
     except Exception:
         pass
-    snap = os.path.join(os.path.dirname(__file__), "channels.json")
-    return json.load(open(snap, encoding="utf-8"))
+    return [{"id": i, "name": union[i]} for i in sorted(union)]
 
 
 @app.route("/playlist.m3u")
