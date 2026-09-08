@@ -90,11 +90,33 @@ def upstream_get(url):
     return s.get(url, timeout=15)
 
 
+ADULT_RE = re.compile(r'^\s*18\+|\bxxx\b|\bporn\b|playboy|brazzers|hustler|dorcel|\beroti[ck]\b', re.I)
+ADULT_IDS = set(range(501, 521))  # bilinen 18+ kanallar (snapshot'tan cikarildi)
+
+
+def is_adult(name):
+    return bool(ADULT_RE.search(name or ''))
+
+
+def _load_adult_ids():
+    try:
+        snap = os.path.join(os.path.dirname(__file__), "channels.json")
+        for c in json.load(open(snap, encoding="utf-8")):
+            if is_adult(c.get("name")):
+                ADULT_IDS.add(c["id"])
+    except Exception:
+        pass
+
+
+_load_adult_ids()
+
+
 def channel_list():
-    """Gomulu snapshot + ana sayfa programi (birlesim). Yeni kanallar boyle eklenir."""
+    """Gomulu snapshot + ana sayfa programi (birlesim). Yetiskin icerik haric."""
     snap = os.path.join(os.path.dirname(__file__), "channels.json")
     try:
-        union = {c["id"]: c["name"] for c in json.load(open(snap, encoding="utf-8"))}
+        union = {c["id"]: c["name"] for c in json.load(open(snap, encoding="utf-8"))
+                 if not is_adult(c.get("name"))}
     except Exception:
         union = {}
     now = time.time()
@@ -102,7 +124,11 @@ def channel_list():
         c = CACHE.get("chanlist")
         if c and now - c["time"] < CHANLIST_TTL:
             for ch in c["url"]:
-                union.setdefault(ch["id"], ch["name"])
+                if is_adult(ch["name"]):
+                    ADULT_IDS.add(ch["id"])
+                    union.pop(ch["id"], None)
+                else:
+                    union.setdefault(ch["id"], ch["name"])
             return [{"id": i, "name": union[i]} for i in sorted(union)]
     try:
         d = _get("https://dlive.sx/", "https://dlive.sx/").text
@@ -116,7 +142,11 @@ def channel_list():
             with CACHE_LOCK:
                 CACHE["chanlist"] = {"url": fresh, "time": now}
             for ch in fresh:
-                union.setdefault(ch["id"], ch["name"])
+                if is_adult(ch["name"]):
+                    ADULT_IDS.add(ch["id"])
+                    union.pop(ch["id"], None)
+                else:
+                    union.setdefault(ch["id"], ch["name"])
     except Exception:
         pass
     return [{"id": i, "name": union[i]} for i in sorted(union)]
@@ -135,6 +165,9 @@ def playlist():
 
 @app.route("/live/<int:cid>.m3u8")
 def live(cid):
+    if cid in ADULT_IDS:
+        return Response("#EXTM3U\n#EXT-X-ENDLIST", status=404,
+                        content_type="application/vnd.apple.mpegurl")
     try:
         url = get_m3u8(cid)
     except Exception as e:
